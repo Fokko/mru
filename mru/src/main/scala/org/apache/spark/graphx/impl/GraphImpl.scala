@@ -194,99 +194,6 @@ class GraphImpl[VD: ClassTag, ED: ClassTag] protected (
   // Lower level transformation methods
   //////////////////////////////////////////////////////////////////////////////////////////////////
 
-  override def mapReduceTriplets[A: ClassTag](
-      mapFunc: EdgeTriplet[VD, ED] => Iterator[(VertexId, A)],
-      reduceFunc: (A, A) => A,
-      activeSetOpt: Option[(VertexRDD[_], EdgeDirection)] = None) = {
-
-    ClosureCleaner.clean(mapFunc)
-    ClosureCleaner.clean(reduceFunc)
-
-    // For each vertex, replicate its attribute only to partitions where it is
-    // in the relevant position in an edge.
-    val mapUsesSrcAttr = accessesVertexAttr(mapFunc, "srcAttr")
-    val mapUsesDstAttr = accessesVertexAttr(mapFunc, "dstAttr")
-    val vs = activeSetOpt match {
-      case Some((activeSet, _)) =>
-        replicatedVertexView.get(mapUsesSrcAttr, mapUsesDstAttr, activeSet)
-      case None =>
-        replicatedVertexView.get(mapUsesSrcAttr, mapUsesDstAttr)
-    }
-    val activeDirectionOpt = activeSetOpt.map(_._2)
-
-    // Map and combine.
-    val preAgg = edges.partitionsRDD.zipPartitions(vs, true) { (ePartIter, vPartIter) =>
-      val (ePid, edgePartition) = ePartIter.next()
-      val (vPid, vPart) = vPartIter.next()
-      assert(!vPartIter.hasNext)
-      assert(ePid == vPid)
-      // Choose scan method
-      val activeFraction = vPart.numActives.getOrElse(0) / edgePartition.indexSize.toFloat
-      val edgeIter = activeDirectionOpt match {
-        case Some(EdgeDirection.Both) =>
-          if (activeFraction < 0.8) {
-            edgePartition.indexIterator(srcVertexId => vPart.isActive(srcVertexId))
-              .filter(e => vPart.isActive(e.dstId))
-          } else {
-            edgePartition.iterator.filter(e => vPart.isActive(e.srcId) && vPart.isActive(e.dstId))
-          }
-        case Some(EdgeDirection.Either) =>
-          // TODO: Because we only have a clustered index on the source vertex ID, we can't filter
-          // the index here. Instead we have to scan all edges and then do the filter.
-          edgePartition.iterator.filter(e => vPart.isActive(e.srcId) || vPart.isActive(e.dstId))
-        case Some(EdgeDirection.Out) =>
-          if (activeFraction < 0.8) {
-            edgePartition.indexIterator(srcVertexId => vPart.isActive(srcVertexId))
-          } else {
-            edgePartition.iterator.filter(e => vPart.isActive(e.srcId))
-          }
-        case Some(EdgeDirection.In) =>
-          edgePartition.iterator.filter(e => vPart.isActive(e.dstId))
-        case _ => // None
-          edgePartition.iterator
-      }
-
-      // Scan edges and run the map function
-      val et = new EdgeTriplet[VD, ED]
-      val mapOutputs = edgeIter.flatMap { e =>
-        et.set(e)
-        if (mapUsesSrcAttr) {
-          et.srcAttr = vPart(e.srcId)
-        }
-        if (mapUsesDstAttr) {
-          et.dstAttr = vPart(e.dstId)
-        }
-        mapFunc(et)
-      }
-      // Note: This doesn't allow users to send messages to arbitrary vertices.
-      vPart.aggregateUsingIndex(mapOutputs, reduceFunc).iterator
-    }
-
-    // do the final reduction reusing the index map
-    vertices.aggregateUsingIndex(preAgg, reduceFunc)
-  } // end of mapReduceTriplets
-
-  override def outerJoinVertices[U: ClassTag, VD2: ClassTag]
-      (other: RDD[(VertexId, U)])
-      (updateF: (VertexId, VD, Option[U]) => VD2): Graph[VD2, ED] =
-  {
-    if (classTag[VD] equals classTag[VD2]) {
-      // updateF preserves type, so we can use incremental replication
-      val newVerts = vertices.leftJoin(other)(updateF)
-      val changedVerts = vertices.asInstanceOf[VertexRDD[VD2]].diff(newVerts)
-      val newReplicatedVertexView = new ReplicatedVertexView[VD2](
-        changedVerts, edges, routingTable,
-        Some(replicatedVertexView.asInstanceOf[ReplicatedVertexView[VD2]]))
-      new GraphImpl(newVerts, edges, routingTable, newReplicatedVertexView)
-    } else {
-      // updateF does not preserve type, so we must re-replicate all vertices
-      val newVerts = vertices.leftJoin(other)(updateF)
-      GraphImpl(newVerts, edges, routingTable)
-    }
-  }
-
-
-
   override def mapReduceUpdate[M: ClassTag](
       mapF: EdgeTriplet[VD, ED] => Iterator[(VertexId, M)],
       reduceF: (M, M) => M,
@@ -323,7 +230,6 @@ class GraphImpl[VD: ClassTag, ED: ClassTag] protected (
       Some(replicatedVertexView.asInstanceOf[ReplicatedVertexView[VD]]))
     new GraphImpl(newVerts, edges, routingTable, newReplicatedVertexView)
   }
-
 
   /** Test whether the closure accesses the the attribute with name `attrName`. */
   private def accessesVertexAttr(closure: AnyRef, attrName: String): Boolean = {
