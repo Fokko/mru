@@ -66,7 +66,7 @@ object SimRank {
     for (i <- 0 until iterN) {
       // Gather adjacent nodes' similarity
       g.cache()
-      g = g.mapReduceTriplets(et => Iterator(
+      g = g.mapReduceUpdate(et => Iterator(
         (et.srcId, (et.dstAttr * et.attr, et.attr)),
         (et.dstId, (et.srcAttr * et.attr, et.attr))
         ),
